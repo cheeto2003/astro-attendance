@@ -5,18 +5,19 @@ const express = require('express');
 const helmet = require('helmet');
 const morgan = require('morgan');
 const { DateTime } = require('luxon');
+const anthropicApiKey = String(process.env.ANTHROPIC_API_KEY || '').trim();
+const claudeModel = String(process.env.CLAUDE_MODEL || 'claude-haiku-4-5-20251001').trim();
+const claudeTimeoutMs = Number(process.env.CLAUDE_TIMEOUT_MS || 3000);
 
 const {
   port,
   webhookSecret,
   adminApiKey,
-  timezone,
-  openclawUrl,
-  openclawKey,
-  openclawTimeoutMs
+  timezone
 } = require('./config');
 const { query, withTransaction } = require('./db');
 const { parseAttendanceMessage, sanitizeMessageText } = require('./parser');
+
 
 const app = express();
 app.use(helmet());
@@ -180,7 +181,13 @@ function toPacificUtcIso(value) {
   }
 
   if (typeof value === 'string' && value.trim()) {
-    return DateTime.fromISO(value.trim(), { zone: 'America/Los_Angeles' }).toUTC().toISO();
+    const trimmed = value.trim();
+
+    const explicit = DateTime.fromISO(trimmed, { setZone: true });
+    if (explicit.isValid) return explicit.toUTC().toISO();
+
+    const pacific = DateTime.fromISO(trimmed, { zone: 'America/Los_Angeles' });
+    if (pacific.isValid) return pacific.toUTC().toISO();
   }
 
   const parsed = new Date(value);
@@ -305,71 +312,168 @@ async function validateRealtimeSequence(client, employeeId, proposedEventType) {
   return { valid: true, latest };
 }
 
-async function explainForReview(rawMessage, parseReason) {
-  if (!openclawUrl) {
+function extractJsonObject(text) {
+  if (!text) return null;
+  const trimmed = String(text).trim();
+
+  try {
+    return JSON.parse(trimmed);
+  } catch (_) {}
+
+  const match = trimmed.match(/\{[\s\S]*\}/);
+  if (!match) return null;
+
+  try {
+    return JSON.parse(match[0]);
+  } catch (_) {
+    return null;
+  }
+}
+
+function normalizeSuggestedEvent(value) {
+  const type = String(value || '').trim().toUpperCase();
+  if (['IN', 'OUT', 'BREAK_START', 'BREAK_END'].includes(type)) return type;
+  return null;
+}
+
+function normalizeConfidenceLabel(value) {
+  const v = String(value || '').trim().toLowerCase();
+  if (['low', 'medium', 'high'].includes(v)) return v;
+  return 'low';
+}
+
+async function callClaudeAttendanceHelper({ rawMessage, messageTimestamp, parseReason }) {
+  const timestampPt = DateTime.fromISO(String(messageTimestamp), { setZone: true })
+    .setZone('America/Los_Angeles');
+
+  const referencePt = timestampPt.isValid
+    ? timestampPt.toFormat("yyyy-LL-dd hh:mm a 'PT'")
+    : DateTime.now().setZone('America/Los_Angeles').toFormat("yyyy-LL-dd hh:mm a 'PT'");
+
+  const prompt = [
+    'You are an attendance review assistant for a Teams attendance channel.',
+    'The strict parser already rejected this message, so you are only suggesting fields for a human reviewer.',
+    'Never auto-approve. shouldLog must always be false.',
+    '',
+    `Original message timestamp in PT: ${referencePt}`,
+    `Original message text: ${rawMessage}`,
+    `Reason strict parser rejected it: ${parseReason}`,
+    '',
+    'Allowed suggestedEvent values:',
+    '- IN',
+    '- OUT',
+    '- BREAK_START',
+    '- BREAK_END',
+    '- null',
+    '',
+    'Rules:',
+    '- Use the message timestamp date as the anchor date for implied times like "until 2pm", "back at 1", "out at 4:30".',
+    '- If no specific time is stated, suggestedTime should be null.',
+    '- If the message seems to mean lunch/break/stepping away, suggest BREAK_START.',
+    '- If the message seems to mean returned/back, suggest BREAK_END.',
+    '- If the message seems to mean starting work, suggest IN.',
+    '- If the message seems to mean ending work/logging off/done, suggest OUT.',
+    '- If uncertain, suggestedEvent should be null.',
+    '',
+    'Return JSON only with this exact shape:',
+    '{',
+    '  "probableIntent": "short phrase",',
+    '  "suggestedEvent": "IN | OUT | BREAK_START | BREAK_END | null",',
+    '  "suggestedTime": "ISO-8601 timestamp with timezone offset or null",',
+    '  "reasonInvalid": "short explanation for reviewer",',
+    '  "confidenceLabel": "low | medium | high",',
+    '  "shouldLog": false',
+    '}'
+  ].join('\n');
+
+  const response = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'x-api-key': anthropicApiKey,
+      'anthropic-version': '2023-06-01',
+      'content-type': 'application/json'
+    },
+    body: JSON.stringify({
+      model: claudeModel,
+      max_tokens: 180,
+      temperature: 0,
+      messages: [
+        {
+          role: 'user',
+          content: prompt
+        }
+      ]
+    })
+  });
+
+  const bodyText = await response.text();
+
+  if (!response.ok) {
+    throw new Error(`Claude HTTP ${response.status}: ${bodyText}`);
+  }
+
+  const parsed = JSON.parse(bodyText);
+  const textBlocks = Array.isArray(parsed.content)
+    ? parsed.content.filter(block => block.type === 'text').map(block => block.text)
+    : [];
+
+  const text = textBlocks.join('\n').trim();
+  const json = extractJsonObject(text);
+
+  if (!json) {
+    throw new Error(`Claude returned non-JSON content: ${text || '[empty]'}`);
+  }
+
+  return {
+    probableIntent: String(json.probableIntent || 'unknown').slice(0, 200),
+    suggestedEvent: normalizeSuggestedEvent(json.suggestedEvent),
+    suggestedTime: toPacificUtcIso(json.suggestedTime),
+    reasonInvalid: String(json.reasonInvalid || parseReason).slice(0, 500),
+    confidenceLabel: normalizeConfidenceLabel(json.confidenceLabel),
+    shouldLog: false,
+    explanationSource: 'claude',
+    rawModelOutput: json
+  };
+}
+
+async function explainForReview(rawMessage, parseReason, messageTimestamp) {
+  if (!anthropicApiKey) {
     return {
       probableIntent: 'unknown',
+      suggestedEvent: null,
+      suggestedTime: null,
       reasonInvalid: parseReason,
       shouldLog: false,
-      suggestedFormat: '',
-      confidenceLabel: 'n/a',
-      explanationSource: 'local'
+      confidenceLabel: 'low',
+      explanationSource: 'local_no_api_key'
     };
   }
 
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), openclawTimeoutMs);
-
-  const systemPrompt = [
-    'You are an attendance review assistant.',
-    'You NEVER approve logging.',
-    'You ONLY explain context for manual review.',
-    'Return JSON only with fields:',
-    'probableIntent, reasonInvalid, shouldLog, suggestedFormat, confidenceLabel.',
-    'shouldLog must always be false.'
-  ].join(' ');
-
   try {
-    const response = await fetch(openclawUrl, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        ...(openclawKey ? { Authorization: `Bearer ${openclawKey}` } : {})
-      },
-      signal: controller.signal,
-      body: JSON.stringify({
-        systemPrompt,
-        messageText: rawMessage,
-        invalidReason: parseReason
-      })
-    });
+    const result = await Promise.race([
+      callClaudeAttendanceHelper({
+        rawMessage,
+        messageTimestamp,
+        parseReason
+      }),
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error('AI timeout')), claudeTimeoutMs)
+      )
+    ]);
 
-    clearTimeout(timeout);
-
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status}`);
-    }
-
-    const text = await response.text();
-    const data = JSON.parse(text);
-
-    return {
-      probableIntent: data.probableIntent || 'unknown',
-      reasonInvalid: data.reasonInvalid || parseReason,
-      shouldLog: false,
-      suggestedFormat: data.suggestedFormat || '',
-      confidenceLabel: data.confidenceLabel || 'low',
-      explanationSource: 'openclaw'
-    };
+    console.log('Claude suggestion:', result);
+    return result;
   } catch (error) {
-    clearTimeout(timeout);
+    console.log('AI failed or timed out:', error.message);
+
     return {
       probableIntent: 'unknown',
-      reasonInvalid: `${parseReason}. Explanation failed: ${error.message}`,
+      suggestedEvent: null,
+      suggestedTime: null,
+      reasonInvalid: `${parseReason}. AI suggestion unavailable: ${error.message}`,
       shouldLog: false,
-      suggestedFormat: '',
-      confidenceLabel: 'n/a',
-      explanationSource: 'fallback_error'
+      confidenceLabel: 'low',
+      explanationSource: 'claude_fallback_error'
     };
   }
 }
@@ -640,34 +744,34 @@ app.post('/webhook/teams', requireWebhookSecret, async (req, res) => {
         };
       }
 
-      const explanation = await explainForReview(rawMessage, parseResult.reason);
+      const explanation = await explainForReview(rawMessage, parseResult.reason, timestamp);
 
-      const review = await client.query(
-        `INSERT INTO review_queue (
-           raw_message_id,
-           employee_id,
-           employee_name,
-           employee_email,
-           probable_intent,
-           suggested_event,
-           suggested_time,
-           reason_flagged,
-           openclaw_explanation,
-           status
-         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'pending')
-         RETURNING id`,
-        [
-          rawMessageId,
-          employee.id,
-          employee.employee_name,
-          employee.employee_email,
-          explanation.probableIntent,
-          null,
-          null,
-          explanation.reasonInvalid,
-          JSON.stringify(explanation)
-        ]
-      );
+	const review = await client.query(
+	  `INSERT INTO review_queue (
+	     raw_message_id,
+	     employee_id,
+	     employee_name,
+	     employee_email,
+	     probable_intent,
+	     suggested_event,
+	     suggested_time,
+	     reason_flagged,
+	     openclaw_explanation,
+	     status
+	   ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'pending')
+	   RETURNING id`,
+	  [
+	    rawMessageId,
+	    employee.id,
+	    employee.employee_name,
+	    employee.employee_email,
+	    explanation.probableIntent,
+	    explanation.suggestedEvent,
+	    explanation.suggestedTime,
+	    explanation.reasonInvalid,
+	    JSON.stringify(explanation)
+	  ]
+	);
 
       await client.query(
         `INSERT INTO audit_log (
@@ -1542,7 +1646,7 @@ app.post('/api/reviews/:id/approve', requireAdminApiKey, async (req, res) => {
       const row = review.rows[0];
 
       const eventType = String(req.body.eventType || '').trim().toUpperCase();
-      const eventTimeValue = req.body.eventTime ?? row.message_timestamp ?? null;
+      const eventTimeValue = req.body.eventTime ?? row.suggested_time ?? row.message_timestamp ?? null;
       const eventTime = toPacificUtcIso(eventTimeValue);
 
       if (!eventType) {
