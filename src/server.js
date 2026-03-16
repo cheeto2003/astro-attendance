@@ -1,0 +1,1760 @@
+require('dotenv').config({ path: require('path').resolve(__dirname, '../.env') });
+
+const crypto = require('crypto');
+const express = require('express');
+const helmet = require('helmet');
+const morgan = require('morgan');
+const { DateTime } = require('luxon');
+
+const {
+  port,
+  webhookSecret,
+  adminApiKey,
+  timezone,
+  openclawUrl,
+  openclawKey,
+  openclawTimeoutMs
+} = require('./config');
+const { query, withTransaction } = require('./db');
+const { parseAttendanceMessage, sanitizeMessageText } = require('./parser');
+
+const app = express();
+app.use(helmet());
+app.use(express.json({ limit: '1mb' }));
+app.use(morgan('combined'));
+
+function getBiweeklyBounds() {
+  const zone = 'America/Los_Angeles';
+
+  const anchorStart = DateTime.fromISO('2026-02-23T00:00:00', { zone }).startOf('day');
+  const now = DateTime.now().setZone(zone);
+
+  const diffDays = Math.floor(now.startOf('day').diff(anchorStart, 'days').days);
+  const cycleIndex = Math.floor(diffDays / 14);
+
+  const currentStart = anchorStart.plus({ days: cycleIndex * 14 });
+  const currentEnd = currentStart.plus({ days: 14 });
+
+  const previousStart = currentStart.minus({ days: 14 });
+  const previousEnd = currentStart;
+
+  return {
+    currentStart,
+    currentEnd,
+    previousStart,
+    previousEnd
+  };
+}
+
+function unauthorized(res) {
+  return res.status(401).json({ ok: false, error: 'Unauthorized' });
+}
+
+function requireWebhookSecret(req, res, next) {
+  if (!webhookSecret) return next();
+  const provided = req.get('X-Webhook-Secret') || '';
+  if (provided !== webhookSecret) return unauthorized(res);
+  next();
+}
+
+function requireAdminApiKey(req, res, next) {
+  if (!adminApiKey) return next();
+  const provided = req.get('X-Admin-Api-Key') || '';
+  if (provided !== adminApiKey) return unauthorized(res);
+  next();
+}
+
+function deriveEmployeeLiveStatus(latestEventType) {
+  switch (String(latestEventType || '').toUpperCase()) {
+    case 'IN':
+    case 'BREAK_END':
+      return 'active';
+
+    case 'BREAK_START':
+    case 'OUT':
+      return 'inactive';
+
+    default:
+      return 'unknown';
+  }
+}
+
+function buildMessageHash({ employeeEmail, channelId, messageId, messageText, timestamp }) {
+  if (messageId) return `teams:${messageId}`;
+  return crypto
+    .createHash('sha256')
+    .update(`${employeeEmail}|${channelId}|${timestamp}|${messageText}`)
+    .digest('hex');
+}
+
+async function getEmployeeByEmailOrName({ employeeEmail, employeeName }) {
+  if (employeeEmail) {
+    const byEmail = await query(
+      `SELECT id, employee_name, employee_email, active
+       FROM employees
+       WHERE lower(employee_email) = lower($1)
+       LIMIT 1`,
+      [employeeEmail]
+    );
+    if (byEmail.rowCount) return byEmail.rows[0];
+  }
+
+  if (employeeName) {
+    const byName = await query(
+      `SELECT id, employee_name, employee_email, active
+       FROM employees
+       WHERE lower(employee_name) = lower($1)
+       LIMIT 1`,
+      [employeeName]
+    );
+    if (byName.rowCount) return byName.rows[0];
+  }
+
+  return null;
+}
+
+function isManualTimeEntry(messageText) {
+  return /^(in|out|break|back)\s+at\s+/i.test(String(messageText || '').trim());
+}
+
+/*
+  Duplicate-friendly sequence rules.
+
+  Goal:
+  - allow "in" -> "actually in"
+  - allow "break" -> "actually break"
+  - allow "back" -> "actually back"
+  - allow repeated "out" too
+
+  This server only decides whether the event can be logged.
+  Final worked-hours calculation should still use a "latest open event wins" approach.
+*/
+function getAllowedNextEvents(lastEventType) {
+  switch (String(lastEventType || '').toUpperCase()) {
+    case '':
+      return ['IN'];
+    case 'IN':
+      return ['IN', 'BREAK', 'OUT'];
+    case 'BREAK':
+      return ['BREAK', 'BACK', 'OUT'];
+    case 'BACK':
+      return ['BACK', 'BREAK', 'OUT'];
+    case 'OUT':
+      return ['IN', 'OUT'];
+    default:
+      return ['IN'];
+  }
+}
+
+async function getLatestAttendanceEvent(client, employeeId) {
+  const result = await client.query(
+    `SELECT id, event_type, event_time, source
+     FROM attendance_events
+     WHERE employee_id = $1
+     ORDER BY event_time DESC, id DESC
+     LIMIT 1`,
+    [employeeId]
+  );
+
+  return result.rowCount ? result.rows[0] : null;
+}
+
+function normalizeEventType(eventType) {
+  const type = String(eventType || '').toUpperCase();
+
+  if (type === 'BREAK_START') return 'BREAK';
+  if (type === 'BREAK_END') return 'BACK';
+
+  return type;
+}
+
+function normalizePayrollEventType(eventType) {
+  return normalizeEventType(eventType);
+}
+
+function toPacificUtcIso(value) {
+  if (!value) return null;
+
+  if (value instanceof Date) {
+    return DateTime.fromJSDate(value, { zone: 'America/Los_Angeles' }).toUTC().toISO();
+  }
+
+  if (typeof value === 'string' && value.trim()) {
+    return DateTime.fromISO(value.trim(), { zone: 'America/Los_Angeles' }).toUTC().toISO();
+  }
+
+  const parsed = new Date(value);
+  if (!Number.isNaN(parsed.getTime())) {
+    return DateTime.fromJSDate(parsed, { zone: 'America/Los_Angeles' }).toUTC().toISO();
+  }
+
+  return null;
+}
+
+function clampSegmentHours(startDt, endDt, rangeStart, rangeEnd) {
+  if (!startDt || !endDt) return 0;
+
+  const clampedStart = startDt < rangeStart ? rangeStart : startDt;
+  const clampedEnd = endDt > rangeEnd ? rangeEnd : endDt;
+
+  if (clampedEnd <= clampedStart) return 0;
+
+  return clampedEnd.diff(clampedStart, 'hours').hours;
+}
+
+function computeWorkedHoursForRange(events, rangeStart, rangeEnd) {
+  let state = 'OFF'; // OFF | WORKING | ON_BREAK
+  let currentWorkStart = null;
+  let workedHours = 0;
+
+  for (const event of events) {
+    const eventType = normalizePayrollEventType(event.event_type);
+    const eventTime = DateTime.fromJSDate(new Date(event.event_time)).toUTC();
+
+    if (!eventTime.isValid) continue;
+
+    switch (eventType) {
+      case 'IN': {
+        if (state === 'OFF') {
+          state = 'WORKING';
+          currentWorkStart = eventTime;
+        } else if (state === 'WORKING') {
+          // latest IN wins
+          currentWorkStart = eventTime;
+        } else if (state === 'ON_BREAK') {
+          // still on break; do not reopen work from IN
+        }
+        break;
+      }
+
+      case 'OUT': {
+        if (state === 'WORKING' && currentWorkStart) {
+          workedHours += clampSegmentHours(
+            currentWorkStart,
+            eventTime,
+            rangeStart,
+            rangeEnd
+          );
+        }
+
+        state = 'OFF';
+        currentWorkStart = null;
+        break;
+      }
+
+      case 'BREAK': {
+        if (state === 'WORKING' && currentWorkStart) {
+          workedHours += clampSegmentHours(
+            currentWorkStart,
+            eventTime,
+            rangeStart,
+            rangeEnd
+          );
+          state = 'ON_BREAK';
+          currentWorkStart = null;
+        }
+        // BREAK while OFF or already ON_BREAK does nothing
+        break;
+      }
+
+      case 'BACK': {
+        if (state === 'ON_BREAK') {
+          state = 'WORKING';
+          currentWorkStart = eventTime;
+        } else if (state === 'WORKING') {
+          // latest BACK wins while already working
+          currentWorkStart = eventTime;
+        }
+        // BACK while OFF does nothing
+        break;
+      }
+
+      default:
+        break;
+    }
+  }
+
+  return Number(workedHours.toFixed(2));
+}
+
+async function validateRealtimeSequence(client, employeeId, proposedEventType) {
+  const latest = await getLatestAttendanceEvent(client, employeeId);
+  const nextEventType = normalizeEventType(proposedEventType);
+
+  if (!latest) {
+    if (nextEventType !== 'IN') {
+      return {
+        valid: false,
+        reason: `Invalid event sequence: first event must be IN, not ${nextEventType}`
+      };
+    }
+
+    return { valid: true, latest: null };
+  }
+
+  const lastEventType = normalizeEventType(latest.event_type);
+  const allowedNext = getAllowedNextEvents(lastEventType);
+
+  if (!allowedNext.includes(nextEventType)) {
+    return {
+      valid: false,
+      reason: `Invalid event sequence: last event was ${lastEventType}, so next allowed event(s): ${allowedNext.join(' or ')}, not ${nextEventType}`
+    };
+  }
+
+  return { valid: true, latest };
+}
+
+async function explainForReview(rawMessage, parseReason) {
+  if (!openclawUrl) {
+    return {
+      probableIntent: 'unknown',
+      reasonInvalid: parseReason,
+      shouldLog: false,
+      suggestedFormat: '',
+      confidenceLabel: 'n/a',
+      explanationSource: 'local'
+    };
+  }
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), openclawTimeoutMs);
+
+  const systemPrompt = [
+    'You are an attendance review assistant.',
+    'You NEVER approve logging.',
+    'You ONLY explain context for manual review.',
+    'Return JSON only with fields:',
+    'probableIntent, reasonInvalid, shouldLog, suggestedFormat, confidenceLabel.',
+    'shouldLog must always be false.'
+  ].join(' ');
+
+  try {
+    const response = await fetch(openclawUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(openclawKey ? { Authorization: `Bearer ${openclawKey}` } : {})
+      },
+      signal: controller.signal,
+      body: JSON.stringify({
+        systemPrompt,
+        messageText: rawMessage,
+        invalidReason: parseReason
+      })
+    });
+
+    clearTimeout(timeout);
+
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+
+    const text = await response.text();
+    const data = JSON.parse(text);
+
+    return {
+      probableIntent: data.probableIntent || 'unknown',
+      reasonInvalid: data.reasonInvalid || parseReason,
+      shouldLog: false,
+      suggestedFormat: data.suggestedFormat || '',
+      confidenceLabel: data.confidenceLabel || 'low',
+      explanationSource: 'openclaw'
+    };
+  } catch (error) {
+    clearTimeout(timeout);
+    return {
+      probableIntent: 'unknown',
+      reasonInvalid: `${parseReason}. Explanation failed: ${error.message}`,
+      shouldLog: false,
+      suggestedFormat: '',
+      confidenceLabel: 'n/a',
+      explanationSource: 'fallback_error'
+    };
+  }
+}
+
+app.get('/health', async (req, res) => {
+  try {
+    await query('SELECT 1');
+    return res.json({
+      ok: true,
+      timezone,
+      uptimeSeconds: Math.round(process.uptime())
+    });
+  } catch (error) {
+    return res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
+app.post('/webhook/teams', requireWebhookSecret, async (req, res) => {
+  try {
+    const employeeName = String(req.body.employeeName || req.body.employee || '').trim();
+    const employeeEmail = String(req.body.employeeEmail || req.body.email || '')
+      .trim()
+      .toLowerCase();
+    const rawMessage = sanitizeMessageText(req.body.messageText || req.body.rawMessage || '');
+    const channelId = String(req.body.channelId || req.body.channel || 'teams').trim();
+
+    const timestamp =
+      req.body.messageTimestamp ||
+      req.body.timestamp ||
+      new Date().toISOString();
+
+    const messageId = String(req.body.messageId || '').trim();
+
+    // Support both old and new payload styles
+    const replyToId = String(req.body.replyToId || '').trim();
+    const isReply = Boolean(req.body.isReply || replyToId);
+
+    const wasEdited = Boolean(req.body.wasEdited || req.body.isEdited || false);
+
+    // Ignore replies immediately
+    if (isReply) {
+      return res.json({ ok: true, status: 'ignored_reply' });
+    }
+
+    // Ignore edits immediately
+    if (wasEdited) {
+      return res.json({ ok: true, status: 'ignored_edit' });
+    }
+
+    const employee = await getEmployeeByEmailOrName({ employeeEmail, employeeName });
+
+    const messageHash = buildMessageHash({
+      employeeEmail,
+      channelId,
+      messageId,
+      messageText: rawMessage,
+      timestamp
+    });
+
+    const duplicate = await query(
+      'SELECT id FROM raw_messages WHERE message_hash = $1 LIMIT 1',
+      [messageHash]
+    );
+
+    if (duplicate.rowCount) {
+      return res.json({ ok: true, status: 'duplicate_skipped' });
+    }
+	const manualTimeEntry = isManualTimeEntry(rawMessage);
+
+	const parserBaseTimestamp = new Date().toISOString();
+	const parseResult = parseAttendanceMessage(rawMessage, parserBaseTimestamp);
+
+    const responsePayload = await withTransaction(async (client) => {
+      const rawInsert = await client.query(
+        `INSERT INTO raw_messages (
+           employee_id,
+           employee_name,
+           employee_email,
+           channel_id,
+           message_id,
+           reply_to_id,
+           message_text,
+           message_timestamp,
+           normalized_text,
+           parse_status,
+           parse_reason,
+           message_hash,
+           was_edited
+         ) VALUES (
+           $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13
+         )
+         RETURNING id`,
+        [
+          employee?.id || null,
+          employee?.employee_name || employeeName || 'Unknown',
+          employee?.employee_email || employeeEmail || '',
+          channelId,
+          messageId || null,
+          replyToId || null,
+          rawMessage,
+          timestamp,
+          parseResult.normalized,
+          parseResult.accepted ? 'accepted' : 'needs_review',
+          parseResult.reason,
+          messageHash,
+          wasEdited
+        ]
+      );
+
+      const rawMessageId = rawInsert.rows[0].id;
+
+      if (!employee) {
+        const employeeNotFoundExplanation = {
+          probableIntent: 'unknown',
+          reasonInvalid: 'Employee not found',
+          shouldLog: false,
+          suggestedFormat: '',
+          confidenceLabel: 'n/a',
+          explanationSource: 'system',
+          message: 'Employee was not found in the employees table. Manual review required.'
+        };
+
+        const review = await client.query(
+          `INSERT INTO review_queue (
+             raw_message_id, employee_name, employee_email,
+             probable_intent, suggested_event, suggested_time,
+             reason_flagged, openclaw_explanation, status
+           ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'pending')
+           RETURNING id`,
+          [
+            rawMessageId,
+            employeeName || 'Unknown',
+            employeeEmail || '',
+            'unknown',
+            null,
+            null,
+            'Employee not found',
+            JSON.stringify(employeeNotFoundExplanation)
+          ]
+        );
+
+        await client.query(
+          `INSERT INTO audit_log (
+             entity_type,
+             entity_id,
+             action,
+             new_value,
+             performed_by,
+             notes
+           )
+           VALUES ('review_queue', $1, 'created', $2, 'system', 'Employee not found')`,
+          [review.rows[0].id, JSON.stringify({ rawMessageId })]
+        );
+
+        return { ok: true, status: 'needs_review', reviewId: review.rows[0].id };
+      }
+
+      if (parseResult.accepted) {
+        
+
+        // Sequence protection only for real-time punches.
+        // Backfilled/manual-time punches are allowed through for now so missed-punch
+        // workflows stay smooth. Historical validation can be added later.
+        if (!manualTimeEntry) {
+          const sequenceCheck = await validateRealtimeSequence(
+            client,
+            employee.id,
+            parseResult.eventType
+          );
+
+          if (!sequenceCheck.valid) {
+            const sequenceExplanation = {
+              probableIntent: String(parseResult.eventType || '').toLowerCase(),
+              reasonInvalid: sequenceCheck.reason,
+              shouldLog: false,
+              suggestedFormat: '',
+              confidenceLabel: 'high',
+              explanationSource: 'sequence_guard'
+            };
+
+            const review = await client.query(
+              `INSERT INTO review_queue (
+                 raw_message_id,
+                 employee_id,
+                 employee_name,
+                 employee_email,
+                 probable_intent,
+                 suggested_event,
+                 suggested_time,
+                 reason_flagged,
+                 openclaw_explanation,
+                 status
+               ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'pending')
+               RETURNING id`,
+              [
+                rawMessageId,
+                employee.id,
+                employee.employee_name,
+                employee.employee_email,
+                sequenceExplanation.probableIntent,
+                parseResult.eventType,
+                parseResult.loggedEventTime,
+                sequenceExplanation.reasonInvalid,
+                JSON.stringify(sequenceExplanation)
+              ]
+            );
+
+            await client.query(
+              `INSERT INTO audit_log (
+                 entity_type,
+                 entity_id,
+                 action,
+                 new_value,
+                 performed_by,
+                 notes
+               )
+               VALUES ('review_queue', $1, 'created', $2, 'system', 'Sequence guard rejected message')`,
+              [review.rows[0].id, JSON.stringify(sequenceExplanation)]
+            );
+
+            return {
+              ok: true,
+              status: 'needs_review',
+              reviewId: review.rows[0].id
+            };
+          }
+        }
+
+        const attendance = await client.query(
+          `INSERT INTO attendance_events (
+             raw_message_id,
+             employee_id,
+             employee_email,
+             event_type,
+             event_time,
+             timezone,
+             source,
+             review_id
+           ) VALUES ($1,$2,$3,$4,$5,'PT',$6,NULL)
+           RETURNING id`,
+          [
+            rawMessageId,
+            employee.id,
+            employee.employee_email,
+            parseResult.eventType,
+            parseResult.loggedEventTime,
+            parseResult.source
+          ]
+        );
+
+        await client.query(
+          `INSERT INTO audit_log (
+             entity_type,
+             entity_id,
+             action,
+             new_value,
+             performed_by,
+             notes
+           )
+           VALUES ('attendance_events', $1, 'created', $2, 'system', 'Auto-logged strict policy match')`,
+          [attendance.rows[0].id, JSON.stringify(parseResult)]
+        );
+
+        return {
+          ok: true,
+          status: 'auto_logged',
+          attendanceEventId: attendance.rows[0].id
+        };
+      }
+
+      const explanation = await explainForReview(rawMessage, parseResult.reason);
+
+      const review = await client.query(
+        `INSERT INTO review_queue (
+           raw_message_id,
+           employee_id,
+           employee_name,
+           employee_email,
+           probable_intent,
+           suggested_event,
+           suggested_time,
+           reason_flagged,
+           openclaw_explanation,
+           status
+         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'pending')
+         RETURNING id`,
+        [
+          rawMessageId,
+          employee.id,
+          employee.employee_name,
+          employee.employee_email,
+          explanation.probableIntent,
+          null,
+          null,
+          explanation.reasonInvalid,
+          JSON.stringify(explanation)
+        ]
+      );
+
+      await client.query(
+        `INSERT INTO audit_log (
+           entity_type,
+           entity_id,
+           action,
+           new_value,
+           performed_by,
+           notes
+         )
+         VALUES ('review_queue', $1, 'created', $2, 'system', 'Strict parser rejected message')`,
+        [review.rows[0].id, JSON.stringify(explanation)]
+      );
+
+      return { ok: true, status: 'needs_review', reviewId: review.rows[0].id };
+    });
+
+    return res.json(responsePayload);
+  } catch (error) {
+    console.error('Webhook processing error:', error);
+    return res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
+app.get('/api/employees', requireAdminApiKey, async (req, res) => {
+  try {
+    const includeInactive =
+      String(req.query.includeInactive || 'false').toLowerCase() === 'true';
+
+    const result = await query(
+      `
+      SELECT
+        e.id,
+        e.employee_name,
+        e.employee_email,
+        e.active,
+        e.created_at,
+        e.updated_at,
+        ae_latest.event_type AS latest_event_type,
+        ae_latest.event_time AS latest_event_time,
+        CASE
+          WHEN ae_latest.event_type IN ('IN', 'BREAK_END') THEN 'active'
+          WHEN ae_latest.event_type IN ('OUT', 'BREAK_START') THEN 'inactive'
+          ELSE 'unknown'
+        END AS status
+      FROM employees e
+      LEFT JOIN LATERAL (
+        SELECT ae.event_type, ae.event_time
+        FROM attendance_events ae
+        WHERE ae.employee_id = e.id
+        ORDER BY ae.event_time DESC, ae.id DESC
+        LIMIT 1
+      ) ae_latest ON true
+      WHERE ($1::boolean = true OR e.active = true)
+      ORDER BY e.employee_name ASC
+      `,
+      [includeInactive]
+    );
+
+    return res.json({
+      ok: true,
+      rows: result.rows
+    });
+  } catch (err) {
+    console.error('get employees failed:', err.message);
+    return res.status(500).json({
+      ok: false,
+      error: 'get employees failed'
+    });
+  }
+});
+
+app.post('/api/employees', requireAdminApiKey, async (req, res) => {
+  const performedBy = req.header('x-admin-user') || 'retool_admin';
+
+  try {
+    const employeeName = String(req.body.employeeName || '').trim();
+    const employeeEmail = String(req.body.employeeEmail || '').trim().toLowerCase();
+    const active =
+      typeof req.body.active === 'boolean' ? req.body.active : true;
+
+    if (!employeeName || !employeeEmail) {
+      return res.status(400).json({
+        ok: false,
+        error: 'employeeName and employeeEmail are required'
+      });
+    }
+
+    const created = await withTransaction(async (client) => {
+      const result = await client.query(
+        `
+        INSERT INTO employees (
+          employee_name,
+          employee_email,
+          active
+        )
+        VALUES ($1, $2, $3)
+        RETURNING *
+        `,
+        [employeeName, employeeEmail, active]
+      );
+
+      const row = result.rows[0];
+
+      await client.query(
+        `
+        INSERT INTO audit_log (
+          entity_type,
+          entity_id,
+          action,
+          old_value,
+          new_value,
+          performed_by,
+          notes
+        )
+        VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, $6, $7)
+        `,
+        [
+          'employee',
+          String(row.id),
+          'create',
+          JSON.stringify({}),
+          JSON.stringify(row),
+          performedBy,
+          'Employee created from Retool'
+        ]
+      );
+
+      return row;
+    });
+
+    return res.json({ ok: true, row: created });
+  } catch (err) {
+    console.error('create employee failed:', err.message);
+
+    if (String(err.message || '').includes('employees_employee_email_key')) {
+      return res.status(400).json({
+        ok: false,
+        error: 'employee email already exists'
+      });
+    }
+
+    return res.status(500).json({
+      ok: false,
+      error: 'create employee failed'
+    });
+  }
+});
+
+app.put('/api/employees/:id', requireAdminApiKey, async (req, res) => {
+  const employeeId = String(req.params.id || '').trim();
+  const performedBy = req.header('x-admin-user') || 'retool_admin';
+
+  try {
+    const employeeName = String(req.body.employeeName || '').trim();
+    const employeeEmail = String(req.body.employeeEmail || '').trim().toLowerCase();
+    const active =
+      typeof req.body.active === 'boolean' ? req.body.active : true;
+
+    if (!employeeId) {
+      return res.status(400).json({
+        ok: false,
+        error: 'employee id is required'
+      });
+    }
+
+    if (!employeeName || !employeeEmail) {
+      return res.status(400).json({
+        ok: false,
+        error: 'employeeName and employeeEmail are required'
+      });
+    }
+
+    const updated = await withTransaction(async (client) => {
+      const existing = await client.query(
+        `
+        SELECT *
+        FROM employees
+        WHERE id = $1
+        LIMIT 1
+        `,
+        [employeeId]
+      );
+
+      if (!existing.rowCount) {
+        throw new Error('employee not found');
+      }
+
+      const oldRow = existing.rows[0];
+
+      const result = await client.query(
+        `
+        UPDATE employees
+        SET
+          employee_name = $1,
+          employee_email = $2,
+          active = $3,
+          updated_at = NOW()
+        WHERE id = $4
+        RETURNING *
+        `,
+        [employeeName, employeeEmail, active, employeeId]
+      );
+
+      const newRow = result.rows[0];
+
+      await client.query(
+        `
+        INSERT INTO audit_log (
+          entity_type,
+          entity_id,
+          action,
+          old_value,
+          new_value,
+          performed_by,
+          notes
+        )
+        VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, $6, $7)
+        `,
+        [
+          'employee',
+          String(employeeId),
+          'update',
+          JSON.stringify(oldRow),
+          JSON.stringify(newRow),
+          performedBy,
+          'Employee updated from Retool'
+        ]
+      );
+
+      return newRow;
+    });
+
+    return res.json({ ok: true, row: updated });
+  } catch (err) {
+    console.error('update employee failed:', err.message);
+
+    if (String(err.message || '').includes('employees_employee_email_key')) {
+      return res.status(400).json({
+        ok: false,
+        error: 'employee email already exists'
+      });
+    }
+
+    if (err.message === 'employee not found') {
+      return res.status(404).json({
+        ok: false,
+        error: 'employee not found'
+      });
+    }
+
+    return res.status(500).json({
+      ok: false,
+      error: 'update employee failed'
+    });
+  }
+});
+
+app.get('/api/reviews', requireAdminApiKey, async (req, res) => {
+  try {
+    const status = String(req.query.status || 'pending');
+
+    const result = await query(
+      `SELECT
+        rq.id,
+        rq.employee_name,
+        rq.employee_email,
+        rq.probable_intent,
+        rq.suggested_event,
+        rq.suggested_time,
+        rq.reason_flagged,
+        rq.status,
+        rq.reviewed_by,
+        rq.reviewed_at,
+        rq.raw_message_id,
+        rq.openclaw_explanation,
+        rq.created_at,
+        rm.message_text
+      FROM review_queue rq
+      LEFT JOIN raw_messages rm
+        ON rm.id = rq.raw_message_id
+      WHERE ($1 = 'all' OR rq.status = $1)
+      ORDER BY rq.created_at DESC
+      LIMIT 500`,
+      [status]
+    );
+
+    return res.json({ ok: true, rows: result.rows });
+  } catch (error) {
+    return res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
+app.get('/api/attendance', requireAdminApiKey, async (req, res) => {
+  try {
+    const result = await query(
+      `
+      SELECT
+        ae.id,
+        e.employee_name,
+        ae.employee_email,
+        ae.event_type,
+        ae.event_time,
+        ae.timezone,
+        ae.source,
+        ae.review_id,
+        ae.created_at,
+        rm.message_text
+      FROM attendance_events ae
+      JOIN employees e
+        ON e.id = ae.employee_id
+      LEFT JOIN raw_messages rm
+        ON rm.id = ae.raw_message_id
+      WHERE e.active = true
+      ORDER BY ae.event_time DESC
+      LIMIT 1000
+      `
+    );
+
+    return res.json({ ok: true, rows: result.rows });
+  } catch (error) {
+    console.error('get attendance failed:', error.message);
+    return res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
+app.get('/debug/db-info', requireAdminApiKey, async (req, res) => {
+  try {
+    const result = await query(`
+      SELECT
+        current_database() AS database_name,
+        current_user AS db_user,
+        inet_server_addr()::text AS server_addr,
+        inet_server_port() AS server_port
+    `);
+
+    return res.json({
+      ok: true,
+      envDatabaseUrl: process.env.DATABASE_URL,
+      dbInfo: result.rows[0]
+    });
+  } catch (err) {
+    return res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.post('/api/attendance/update', requireAdminApiKey, async (req, res) => {
+  try {
+    const rows = Array.isArray(req.body.rows) ? req.body.rows : [];
+
+    console.log('incoming rows:', JSON.stringify(rows, null, 2));
+
+    for (const row of rows) {
+      const existing = await query(
+        `SELECT event_type, event_time
+         FROM attendance_events
+         WHERE id = $1`,
+        [row.id]
+      );
+
+      if (!existing.rowCount) continue;
+
+      const current = existing.rows[0];
+
+      const updated = await query(
+        `UPDATE attendance_events
+         SET event_type = $1,
+             event_time = $2
+         WHERE id = $3
+         RETURNING *`,
+        [
+	  row.event_type ?? current.event_type,
+	  row.event_time ? toPacificUtcIso(row.event_time) : current.event_time,
+	  row.id
+        ]
+      );
+
+      console.log('updated row:', updated.rows[0]);
+    }
+
+    return res.json({ ok: true, updated: rows.length });
+  } catch (err) {
+    console.error('attendance update error:', err);
+    return res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.get('/api/biweekly-summary', requireAdminApiKey, async (req, res) => {
+  try {
+    const bounds = getBiweeklyBounds();
+
+    const employeesResult = await query(
+      `
+      SELECT id, employee_name, employee_email
+      FROM employees
+      WHERE active = true
+      ORDER BY employee_name
+      `
+    );
+
+    const eventsResult = await query(
+      `
+      SELECT
+        id,
+        employee_id,
+        employee_email,
+        event_type,
+        event_time
+      FROM attendance_events
+      ORDER BY employee_id, event_time ASC, id ASC
+      `
+    );
+
+    const eventsByEmployee = new Map();
+
+    for (const event of eventsResult.rows) {
+      const key = String(event.employee_id);
+      if (!eventsByEmployee.has(key)) {
+        eventsByEmployee.set(key, []);
+      }
+      eventsByEmployee.get(key).push(event);
+    }
+
+    const currentStart = bounds.currentStart.toUTC();
+    const currentEnd = bounds.currentEnd.toUTC();
+    const previousStart = bounds.previousStart.toUTC();
+    const previousEnd = bounds.previousEnd.toUTC();
+
+    const rows = employeesResult.rows.map((employee) => {
+      const employeeEvents = eventsByEmployee.get(String(employee.id)) || [];
+
+      const biweeklyCurrent = computeWorkedHoursForRange(
+        employeeEvents,
+        currentStart,
+        currentEnd
+      );
+
+      const biweeklyPrevious = computeWorkedHoursForRange(
+        employeeEvents,
+        previousStart,
+        previousEnd
+      );
+
+      return {
+        name: employee.employee_name,
+        email: employee.employee_email,
+        biweekly_current: biweeklyCurrent,
+        biweekly_previous: biweeklyPrevious
+      };
+    });
+
+    return res.json({
+      ok: true,
+      pay_periods: {
+        current_start: bounds.currentStart.toISO(),
+        current_end: bounds.currentEnd.toISO(),
+        previous_start: bounds.previousStart.toISO(),
+        previous_end: bounds.previousEnd.toISO()
+      },
+      rows
+    });
+  } catch (err) {
+    console.error('biweekly summary failed:', err);
+    return res.status(500).json({ ok: false, error: 'biweekly summary failed' });
+  }
+});
+
+app.post('/api/attendance/manual', requireAdminApiKey, async (req, res) => {
+  const { employeeId, eventType, eventTime } = req.body;
+  const performedBy = req.header('x-admin-user') || 'retool_admin';
+  const normalizedEventTime = toPacificUtcIso(eventTime);
+
+  try {
+    if (!employeeId || !eventType || !normalizedEventTime) {
+      return res.status(400).json({
+        ok: false,
+        error: 'employeeId, eventType, and eventTime are required'
+      });
+    }
+
+    const validEventTypes = ['IN', 'OUT', 'BREAK_START', 'BREAK_END'];
+    if (!validEventTypes.includes(eventType)) {
+      return res.status(400).json({
+        ok: false,
+        error: 'invalid event type'
+      });
+    }
+
+    const createdRow = await withTransaction(async (client) => {
+      const employeeResult = await client.query(
+        `
+        SELECT id, employee_name, employee_email
+        FROM employees
+        WHERE id = $1
+        `,
+        [employeeId]
+      );
+
+      if (employeeResult.rows.length === 0) {
+        throw new Error('employee not found');
+      }
+
+      const employee = employeeResult.rows[0];
+
+      const rawMessageResult = await client.query(
+        `
+        INSERT INTO raw_messages (
+          employee_id,
+          employee_name,
+          employee_email,
+          channel_id,
+          message_id,
+          reply_to_id,
+          message_text,
+          message_timestamp,
+          normalized_text,
+          parse_status,
+          parse_reason,
+          message_hash,
+          was_edited
+        )
+        VALUES (
+          $1,
+          $2,
+          $3,
+          'manual-entry',
+          NULL,
+          NULL,
+          'no msg this is manually added',
+          $4::timestamptz,
+          'no msg this is manually added',
+          'accepted',
+          'manual admin entry',
+          encode(gen_random_bytes(32), 'hex'),
+          false
+        )
+        RETURNING id
+        `,
+        [
+          employee.id,
+          employee.employee_name,
+          employee.employee_email,
+          normalizedEventTime
+        ]
+      );
+
+      const rawMessageId = rawMessageResult.rows[0].id;
+
+      const attendanceResult = await client.query(
+        `
+        INSERT INTO attendance_events (
+          raw_message_id,
+          employee_id,
+          employee_email,
+          event_type,
+          event_time,
+          timezone,
+          source,
+          review_id
+        )
+        VALUES (
+          $1,
+          $2,
+          $3,
+          $4,
+          $5::timestamptz,
+          'PT',
+          'admin_edit',
+          NULL
+        )
+        RETURNING *
+        `,
+        [
+          rawMessageId,
+          employee.id,
+          employee.employee_email,
+          eventType,
+          normalizedEventTime
+        ]
+      );
+
+      const newRow = attendanceResult.rows[0];
+
+      await client.query(
+        `
+        INSERT INTO audit_log (
+          entity_type,
+          entity_id,
+          action,
+          old_value,
+          new_value,
+          performed_by,
+          notes
+        )
+        VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, $6, $7)
+        `,
+        [
+          'attendance_event',
+          String(newRow.id),
+          'create_manual',
+          JSON.stringify({}),
+          JSON.stringify(newRow),
+          performedBy,
+          'Manual attendance event added from Attendance Master'
+        ]
+      );
+
+      return newRow;
+    });
+
+    return res.json({ ok: true, row: createdRow });
+
+  } catch (err) {
+    console.error('manual attendance create failed:', err.message);
+    return res.status(400).json({ ok: false, error: err.message });
+  }
+});
+
+app.delete('/api/employees/:id', requireAdminApiKey, async (req, res) => {
+  const employeeId = String(req.params.id || '').trim();
+  const performedBy = req.header('x-admin-user') || 'retool_admin';
+
+  try {
+    if (!employeeId) {
+      return res.status(400).json({
+        ok: false,
+        error: 'employee id is required'
+      });
+    }
+
+    const payload = await withTransaction(async (client) => {
+      const employeeResult = await client.query(
+        `
+        SELECT *
+        FROM employees
+        WHERE id = $1
+        LIMIT 1
+        `,
+        [employeeId]
+      );
+
+      if (!employeeResult.rowCount) {
+        throw new Error('employee not found');
+      }
+
+      const employee = employeeResult.rows[0];
+
+      const attendanceResult = await client.query(
+        `
+        SELECT id
+        FROM attendance_events
+        WHERE employee_id = $1
+        `,
+        [employeeId]
+      );
+
+      const reviewResult = await client.query(
+        `
+        SELECT id
+        FROM review_queue
+        WHERE employee_id = $1
+           OR lower(employee_email) = lower($2)
+        `,
+        [employeeId, employee.employee_email]
+      );
+
+      const rawResult = await client.query(
+        `
+        SELECT id
+        FROM raw_messages
+        WHERE employee_id = $1
+           OR lower(employee_email) = lower($2)
+        `,
+        [employeeId, employee.employee_email]
+      );
+
+      const attendanceIds = attendanceResult.rows.map(r => String(r.id));
+      const reviewIds = reviewResult.rows.map(r => String(r.id));
+      const rawIds = rawResult.rows.map(r => String(r.id));
+
+      // remove audit rows tied to attendance events
+      if (attendanceIds.length) {
+        await client.query(
+          `
+          DELETE FROM audit_log
+          WHERE entity_type IN ('attendance_event', 'attendance_events')
+            AND entity_id = ANY($1::text[])
+          `,
+          [attendanceIds]
+        );
+      }
+
+      // remove audit rows tied to reviews
+      if (reviewIds.length) {
+        await client.query(
+          `
+          DELETE FROM audit_log
+          WHERE entity_type = 'review_queue'
+            AND entity_id = ANY($1::text[])
+          `,
+          [reviewIds]
+        );
+      }
+
+      // remove audit rows tied to the employee record
+      await client.query(
+        `
+        DELETE FROM audit_log
+        WHERE entity_type = 'employee'
+          AND entity_id = $1
+        `,
+        [employeeId]
+      );
+
+      // delete attendance first because attendance_events has RESTRICT FKs
+      await client.query(
+        `
+        DELETE FROM attendance_events
+        WHERE employee_id = $1
+        `,
+        [employeeId]
+      );
+
+      // then delete reviews
+      await client.query(
+        `
+        DELETE FROM review_queue
+        WHERE employee_id = $1
+           OR lower(employee_email) = lower($2)
+        `,
+        [employeeId, employee.employee_email]
+      );
+
+      // then delete raw messages
+      await client.query(
+        `
+        DELETE FROM raw_messages
+        WHERE employee_id = $1
+           OR lower(employee_email) = lower($2)
+        `,
+        [employeeId, employee.employee_email]
+      );
+
+      // finally delete employee
+      await client.query(
+        `
+        DELETE FROM employees
+        WHERE id = $1
+        `,
+        [employeeId]
+      );
+
+      return {
+        deletedEmployee: {
+          id: employee.id,
+          employee_name: employee.employee_name,
+          employee_email: employee.employee_email
+        },
+        deletedCounts: {
+          attendance_events: attendanceIds.length,
+          review_queue: reviewIds.length,
+          raw_messages: rawIds.length
+        }
+      };
+    });
+
+    return res.json({
+      ok: true,
+      message: 'employee and related records permanently deleted',
+      ...payload
+    });
+  } catch (err) {
+    console.error('delete employee failed:', err.message);
+    return res.status(400).json({
+      ok: false,
+      error: err.message
+    });
+  }
+});
+
+app.delete('/api/attendance/:id', requireAdminApiKey, async (req, res) => {
+  const attendanceId = req.params.id;
+  const performedBy = req.header('x-admin-user') || 'retool_admin';
+
+  try {
+    await withTransaction(async (client) => {
+      const existing = await client.query(
+        `
+        SELECT *
+        FROM attendance_events
+        WHERE id = $1
+        `,
+        [attendanceId]
+      );
+
+      if (existing.rows.length === 0) {
+        throw new Error('attendance event not found');
+      }
+
+      const oldRow = existing.rows[0];
+
+      await client.query(
+        `
+        INSERT INTO audit_log (
+          entity_type,
+          entity_id,
+          action,
+          old_value,
+          new_value,
+          performed_by,
+          notes
+        )
+        VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, $6, $7)
+        `,
+        [
+          'attendance_event',
+          String(attendanceId),
+          'delete',
+          JSON.stringify(oldRow),
+          JSON.stringify({ deleted: true }),
+          performedBy,
+          'Deleted from Attendance Master page'
+        ]
+      );
+
+      await client.query(
+        `
+        DELETE FROM attendance_events
+        WHERE id = $1
+        `,
+        [attendanceId]
+      );
+    });
+
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error('delete attendance failed:', err.message);
+    return res.status(400).json({ ok: false, error: err.message });
+  }
+});
+
+app.post('/api/reviews/:id/approve', requireAdminApiKey, async (req, res) => {
+  try {
+    const reviewId = Number(req.params.id);
+    const reviewedBy = String(req.body.reviewedBy || 'retool_admin').trim();
+
+    const payload = await withTransaction(async (client) => {
+      const review = await client.query(
+        `
+        SELECT
+          rq.*,
+          rm.message_timestamp,
+          rm.employee_name AS raw_employee_name,
+          rm.employee_email AS raw_employee_email
+        FROM review_queue rq
+        JOIN raw_messages rm
+          ON rm.id = rq.raw_message_id
+        WHERE rq.id = $1
+        LIMIT 1
+        `,
+        [reviewId]
+      );
+
+      if (!review.rowCount) {
+        throw new Error('Review item not found');
+      }
+
+      if (review.rows[0].status !== 'pending') {
+        throw new Error('Review item is no longer pending');
+      }
+
+      const row = review.rows[0];
+
+      const eventType = String(req.body.eventType || '').trim().toUpperCase();
+      const eventTimeValue = req.body.eventTime ?? row.message_timestamp ?? null;
+      const eventTime = toPacificUtcIso(eventTimeValue);
+
+      if (!eventType) {
+        throw new Error('eventType is required for approval');
+      }
+
+      if (!eventTime) {
+        throw new Error('eventTime is required for approval');
+      }
+
+      const validEventTypes = ['IN', 'OUT', 'BREAK_START', 'BREAK_END'];
+      if (!validEventTypes.includes(eventType)) {
+        throw new Error('invalid event type');
+      }
+
+      let employeeId = row.employee_id;
+      let employeeEmail = row.employee_email;
+      let employeeName = row.employee_name;
+
+      // Re-resolve employee at approval time in case they were added later.
+      if (!employeeId) {
+        const lookupName =
+          String(row.employee_name || row.raw_employee_name || '').trim();
+
+        const lookupEmail =
+          String(row.employee_email || row.raw_employee_email || '')
+            .trim()
+            .toLowerCase();
+
+        let employeeResult = null;
+
+        if (lookupEmail) {
+          employeeResult = await client.query(
+            `
+            SELECT id, employee_name, employee_email, active
+            FROM employees
+            WHERE lower(employee_email) = lower($1)
+            LIMIT 1
+            `,
+            [lookupEmail]
+          );
+        }
+
+        if ((!employeeResult || !employeeResult.rowCount) && lookupName) {
+          employeeResult = await client.query(
+            `
+            SELECT id, employee_name, employee_email, active
+            FROM employees
+            WHERE lower(employee_name) = lower($1)
+            LIMIT 1
+            `,
+            [lookupName]
+          );
+        }
+
+        if (!employeeResult || !employeeResult.rowCount) {
+          throw new Error(
+            'Employee still not found. Add them in Employee Master first, then approve again.'
+          );
+        }
+
+        const employee = employeeResult.rows[0];
+
+        if (!employee.active) {
+          throw new Error('Employee exists but is inactive');
+        }
+
+        employeeId = employee.id;
+        employeeEmail = employee.employee_email;
+        employeeName = employee.employee_name;
+
+        await client.query(
+          `
+          UPDATE review_queue
+          SET
+            employee_id = $2,
+            employee_name = $3,
+            employee_email = $4
+          WHERE id = $1
+          `,
+          [reviewId, employeeId, employeeName, employeeEmail]
+        );
+
+        await client.query(
+          `
+          UPDATE raw_messages
+          SET
+            employee_id = $2,
+            employee_name = $3,
+            employee_email = $4
+          WHERE id = $1
+          `,
+          [row.raw_message_id, employeeId, employeeName, employeeEmail]
+        );
+      }
+
+      const inserted = await client.query(
+        `
+        INSERT INTO attendance_events (
+          raw_message_id,
+          employee_id,
+          employee_email,
+          event_type,
+          event_time,
+          timezone,
+          source,
+          review_id
+        )
+        VALUES ($1,$2,$3,$4,$5,'PT','review',$6)
+        RETURNING id
+        `,
+        [row.raw_message_id, employeeId, employeeEmail, eventType, eventTime, reviewId]
+      );
+
+      await client.query(
+        `
+        UPDATE review_queue
+        SET
+          status = 'approved',
+          reviewed_by = $2,
+          reviewed_at = NOW()
+        WHERE id = $1
+        `,
+        [reviewId, reviewedBy]
+      );
+
+      await client.query(
+        `
+        INSERT INTO audit_log (
+          entity_type,
+          entity_id,
+          action,
+          old_value,
+          new_value,
+          performed_by,
+          notes
+        )
+        VALUES ('review_queue', $1, 'approved', $2, $3, $4, 'Approved in admin tool')
+        `,
+        [
+          reviewId,
+          JSON.stringify({ status: 'pending' }),
+          JSON.stringify({
+            status: 'approved',
+            attendanceEventId: inserted.rows[0].id,
+            employeeId,
+            employeeEmail,
+            eventType,
+            eventTime
+          }),
+          reviewedBy
+        ]
+      );
+
+      return {
+        ok: true,
+        status: 'approved',
+        attendanceEventId: inserted.rows[0].id
+      };
+    });
+
+    return res.json(payload);
+  } catch (error) {
+    return res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
+app.post('/api/reviews/:id/reject', requireAdminApiKey, async (req, res) => {
+  try {
+    const reviewId = Number(req.params.id);
+    const reviewedBy = String(req.body.reviewedBy || 'retool_admin').trim();
+    const reviewNotes = String(req.body.reviewNotes || '').trim();
+
+    const payload = await withTransaction(async (client) => {
+      const result = await client.query(
+        `UPDATE review_queue
+         SET status = 'rejected',
+             reviewed_by = $2,
+             reviewed_at = NOW(),
+             review_notes = $3
+         WHERE id = $1
+           AND status = 'pending'
+         RETURNING id`,
+        [reviewId, reviewedBy, reviewNotes]
+      );
+
+      if (!result.rowCount) {
+        throw new Error('Review item not found or no longer pending');
+      }
+
+      await client.query(
+        `INSERT INTO audit_log (
+           entity_type,
+           entity_id,
+           action,
+           new_value,
+           performed_by,
+           notes
+         )
+         VALUES ('review_queue', $1, 'rejected', $2, $3, 'Rejected in admin tool')`,
+        [reviewId, JSON.stringify({ reviewNotes }), reviewedBy]
+      );
+
+      return { ok: true, status: 'rejected' };
+    });
+
+    return res.json(payload);
+  } catch (error) {
+    return res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
+app.listen(port, () => {
+  console.log(`ASTRO attendance backend listening on port ${port}`);
+});
