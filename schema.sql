@@ -86,3 +86,24 @@ INSERT INTO employees (employee_name, employee_email)
 VALUES
   ('Gene Orias', 'gene@astroinfosec.com')
 ON CONFLICT (employee_email) DO NOTHING;
+
+
+CREATE TABLE IF NOT EXISTS archive_manifest (
+  id BIGSERIAL PRIMARY KEY,
+  table_name TEXT NOT NULL,
+  file_name TEXT NOT NULL,
+  file_path TEXT NOT NULL,
+  cutoff_time TIMESTAMPTZ NOT NULL,
+  row_count INTEGER NOT NULL DEFAULT 0,
+  checksum_sha256 TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('exported', 'verified', 'failed')),
+  performed_by TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  notes TEXT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_archive_manifest_created_at
+  ON archive_manifest(created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_archive_manifest_table_cutoff
+  ON archive_manifest(table_name, cutoff_time DESC);

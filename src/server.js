@@ -1,6 +1,11 @@
 require('dotenv').config({ path: require('path').resolve(__dirname, '../.env') });
 
 const crypto = require('crypto');
+const fs = require('fs');
+const fsp = require('fs/promises');
+const path = require('path');
+const { execFile } = require('child_process');
+const { promisify } = require('util');
 const express = require('express');
 const helmet = require('helmet');
 const morgan = require('morgan');
@@ -18,6 +23,7 @@ const {
 const { query, withTransaction } = require('./db');
 const { parseAttendanceMessage, sanitizeMessageText } = require('./parser');
 
+const execFileAsync = promisify(execFile);
 
 const app = express();
 app.use(helmet());
@@ -45,6 +51,404 @@ function getBiweeklyBounds() {
     previousStart,
     previousEnd
   };
+}
+
+const archiveDir = path.resolve(__dirname, '../archives');
+const AUTO_ARCHIVE_ENABLED =
+  String(process.env.AUTO_ARCHIVE_ENABLED || 'true').toLowerCase() === 'true';
+const AUTO_ARCHIVE_INTERVAL_MS = Number(
+  process.env.AUTO_ARCHIVE_INTERVAL_MS || 60 * 60 * 1000
+);
+const AUTO_ARCHIVE_TABLE_ORDER = [
+  'attendance_events',
+  'review_queue',
+  'raw_messages',
+  'audit_log'
+];
+
+const ARCHIVE_TABLES = {
+  attendance_events: {
+    orderBy: 'event_time ASC, id ASC',
+    defaultDateColumn: 'event_time',
+    columns: [
+      'id',
+      'raw_message_id',
+      'employee_id',
+      'employee_email',
+      'event_type',
+      'event_time',
+      'timezone',
+      'source',
+      'review_id',
+      'created_at'
+    ]
+  },
+  raw_messages: {
+    orderBy: 'message_timestamp ASC, id ASC',
+    defaultDateColumn: 'message_timestamp',
+    columns: [
+      'id',
+      'employee_id',
+      'employee_name',
+      'employee_email',
+      'channel_id',
+      'message_id',
+      'reply_to_id',
+      'message_text',
+      'message_timestamp',
+      'normalized_text',
+      'parse_status',
+      'parse_reason',
+      'message_hash',
+      'was_edited',
+      'created_at'
+    ]
+  },
+  review_queue: {
+    orderBy: 'created_at ASC, id ASC',
+    defaultDateColumn: 'created_at',
+    columns: [
+      'id',
+      'raw_message_id',
+      'employee_id',
+      'employee_name',
+      'employee_email',
+      'probable_intent',
+      'suggested_event',
+      'suggested_time',
+      'reason_flagged',
+      'openclaw_explanation',
+      'status',
+      'reviewed_by',
+      'reviewed_at',
+      'review_notes',
+      'created_at'
+    ]
+  },
+  audit_log: {
+    orderBy: 'created_at ASC, id ASC',
+    defaultDateColumn: 'created_at',
+    columns: [
+      'id',
+      'entity_type',
+      'entity_id',
+      'action',
+      'old_value',
+      'new_value',
+      'performed_by',
+      'notes',
+      'created_at'
+    ]
+  }
+};
+
+function normalizeArchiveTables(input) {
+  const allowed = Object.keys(ARCHIVE_TABLES);
+
+  let raw = input;
+
+  if (!raw || raw === 'all') {
+    return { tables: AUTO_ARCHIVE_TABLE_ORDER, invalid: [] };
+  }
+
+  if (typeof raw === 'string') {
+    raw = raw.split(',').map((v) => v.trim()).filter(Boolean);
+  }
+
+  if (!Array.isArray(raw) || raw.length === 0) {
+    return { tables: AUTO_ARCHIVE_TABLE_ORDER, invalid: [] };
+  }
+
+  const invalid = raw.filter((t) => !allowed.includes(t));
+  const tables = raw.filter((t) => allowed.includes(t));
+
+  return {
+    tables: tables.length ? tables : AUTO_ARCHIVE_TABLE_ORDER,
+    invalid
+  };
+}
+
+function csvEscape(value) {
+  if (value === null || value === undefined) return '';
+  let normalized = value;
+
+  if (normalized instanceof Date) {
+    normalized = normalized.toISOString();
+  } else if (typeof normalized === 'object') {
+    normalized = JSON.stringify(normalized);
+  } else {
+    normalized = String(normalized);
+  }
+
+  const escaped = String(normalized).replace(/"/g, '""');
+  return `"${escaped}"`;
+}
+
+function rowsToCsv(columns, rows) {
+  const header = columns.map(csvEscape).join(',');
+  const lines = rows.map((row) => columns.map((col) => csvEscape(row[col])).join(','));
+  return [header, ...lines].join('');
+}
+
+async function ensureArchiveDir() {
+  await fsp.mkdir(archiveDir, { recursive: true });
+}
+
+function getExactArchiveWindow() {
+  const bounds = getBiweeklyBounds();
+
+  const archiveStart = bounds.previousStart.minus({ days: 14 }).toUTC();
+  const archiveEnd = bounds.previousStart.toUTC();
+
+  return {
+    archiveStartIso: archiveStart.toISO(),
+    archiveEndIso: archiveEnd.toISO(),
+    fileStartLabel: archiveStart.toISODate(),
+    fileEndLabel: archiveEnd.minus({ days: 1 }).toISODate()
+  };
+}
+
+function buildArchiveCsvFileName({ tableName, fileStartLabel, fileEndLabel, stamp }) {
+  return `${tableName}_${fileStartLabel}_to_${fileEndLabel}_${stamp}.csv`;
+}
+
+function buildArchiveZipFileName({ tableName, fileStartLabel, fileEndLabel, stamp }) {
+  return `${tableName}_${fileStartLabel}_to_${fileEndLabel}_${stamp}.zip`;
+}
+
+async function zipCsvFile(csvPath, zipPath) {
+  await execFileAsync('zip', ['-j', '-q', '-9', zipPath, csvPath]);
+}
+
+async function hasArchiveManifestForWindow(client, tableName, archiveEndIso) {
+  const result = await client.query(
+    `
+    SELECT id, table_name, file_name, file_path, cutoff_time, row_count, checksum_sha256, status, performed_by, created_at, notes
+    FROM archive_manifest
+    WHERE table_name = $1
+      AND cutoff_time = $2::timestamptz
+      AND status IN ('exported', 'verified')
+    ORDER BY id DESC
+    LIMIT 1
+    `,
+    [tableName, archiveEndIso]
+  );
+
+  return result.rowCount ? result.rows[0] : null;
+}
+
+async function previewArchiveTable(client, tableName) {
+  const config = ARCHIVE_TABLES[tableName];
+  const { archiveStartIso, archiveEndIso, fileStartLabel, fileEndLabel } = getExactArchiveWindow();
+
+  const countResult = await client.query(
+    `SELECT COUNT(*)::int AS row_count
+     FROM ${tableName}
+     WHERE ${config.defaultDateColumn} >= $1::timestamptz
+       AND ${config.defaultDateColumn} < $2::timestamptz`,
+    [archiveStartIso, archiveEndIso]
+  );
+
+  const sampleResult = await client.query(
+    `SELECT ${config.columns.join(', ')}
+     FROM ${tableName}
+     WHERE ${config.defaultDateColumn} >= $1::timestamptz
+       AND ${config.defaultDateColumn} < $2::timestamptz
+     ORDER BY ${config.orderBy}
+     LIMIT 5`,
+    [archiveStartIso, archiveEndIso]
+  );
+
+  const alreadyArchived = await hasArchiveManifestForWindow(client, tableName, archiveEndIso);
+
+  return {
+    table_name: tableName,
+    archive_start: archiveStartIso,
+    archive_end: archiveEndIso,
+    file_start_label: fileStartLabel,
+    file_end_label: fileEndLabel,
+    row_count: countResult.rows[0].row_count,
+    already_archived: Boolean(alreadyArchived),
+    existing_manifest_id: alreadyArchived?.id || null,
+    existing_file_name: alreadyArchived?.file_name || null,
+    sample_rows: sampleResult.rows
+  };
+}
+
+async function exportArchiveTable(client, tableName, performedBy) {
+  const config = ARCHIVE_TABLES[tableName];
+
+  if (!config) {
+    throw new Error(`Unsupported archive table: ${tableName}`);
+  }
+
+  const { archiveStartIso, archiveEndIso, fileStartLabel, fileEndLabel } =
+    getExactArchiveWindow();
+
+  const alreadyArchived = await hasArchiveManifestForWindow(
+    client,
+    tableName,
+    archiveEndIso
+  );
+
+  if (alreadyArchived) {
+    return {
+      ...alreadyArchived,
+      notes: `Skipped: already archived pay period ${fileStartLabel} to ${fileEndLabel}`
+    };
+  }
+
+  const dateColumn = config.defaultDateColumn;
+
+  const rowsResult = await client.query(
+    `SELECT ${config.columns.join(', ')}
+     FROM ${tableName}
+     WHERE ${dateColumn} >= $1::timestamptz
+       AND ${dateColumn} < $2::timestamptz
+     ORDER BY ${config.orderBy}`,
+    [archiveStartIso, archiveEndIso]
+  );
+
+  const rows = rowsResult.rows;
+  const rowCount = rowsResult.rowCount;
+  const csv = rowsToCsv(config.columns, rows);
+  const stamp = DateTime.now()
+    .setZone('America/Los_Angeles')
+    .toFormat('yyyyLLdd_HHmmss');
+  const csvFileName = buildArchiveCsvFileName({ tableName, fileStartLabel, fileEndLabel, stamp });
+  const zipFileName = buildArchiveZipFileName({ tableName, fileStartLabel, fileEndLabel, stamp });
+  const csvPath = path.join(archiveDir, csvFileName);
+  const zipPath = path.join(archiveDir, zipFileName);
+
+  await ensureArchiveDir();
+  await fsp.writeFile(csvPath, csv, 'utf8');
+  await zipCsvFile(csvPath, zipPath);
+  await fsp.unlink(csvPath);
+
+  const zipBuffer = await fsp.readFile(zipPath);
+  const checksum = crypto.createHash('sha256').update(zipBuffer).digest('hex');
+
+  const manifestResult = await client.query(
+    `
+    INSERT INTO archive_manifest (
+      table_name,
+      file_name,
+      file_path,
+      cutoff_time,
+      row_count,
+      checksum_sha256,
+      status,
+      performed_by,
+      notes
+    )
+    VALUES ($1,$2,$3,$4::timestamptz,$5,$6,'exported',$7,$8)
+    RETURNING id, table_name, file_name, file_path, cutoff_time, row_count, checksum_sha256, status, performed_by, created_at, notes
+    `,
+    [
+      tableName,
+      zipFileName,
+      zipPath,
+      archiveEndIso,
+      rowCount,
+      checksum,
+      performedBy,
+      rowCount > 0
+        ? `Archived exact pay period ${fileStartLabel} to ${fileEndLabel}`
+        : `No rows matched exact pay period ${fileStartLabel} to ${fileEndLabel}`
+    ]
+  );
+
+  if (rowCount > 0) {
+    await client.query(
+      `DELETE FROM ${tableName}
+       WHERE ${dateColumn} >= $1::timestamptz
+         AND ${dateColumn} < $2::timestamptz`,
+      [archiveStartIso, archiveEndIso]
+    );
+  }
+
+  await client.query(
+    `
+    INSERT INTO audit_log (
+      entity_type,
+      entity_id,
+      action,
+      old_value,
+      new_value,
+      performed_by,
+      notes
+    )
+    VALUES ('archive_manifest', $1, 'export_zip', $2::jsonb, $3::jsonb, $4, $5)
+    `,
+    [
+      String(manifestResult.rows[0].id),
+      JSON.stringify({}),
+      JSON.stringify({
+        tableName,
+        fileName: zipFileName,
+        rowCount,
+        archiveStartIso,
+        archiveEndIso,
+        checksum
+      }),
+      performedBy,
+      rowCount > 0
+        ? `Archive export + delete completed for ${fileStartLabel} to ${fileEndLabel}`
+        : `Archive window had no matching rows for ${fileStartLabel} to ${fileEndLabel}`
+    ]
+  );
+
+  return manifestResult.rows[0];
+}
+
+async function runAutomaticArchive(reason = 'scheduled_auto_archive') {
+  return withTransaction(async (client) => {
+    const manifests = [];
+
+    for (const tableName of AUTO_ARCHIVE_TABLE_ORDER) {
+      const manifest = await exportArchiveTable(client, tableName, reason);
+      manifests.push(manifest);
+    }
+
+    return {
+      archiveWindow: getExactArchiveWindow(),
+      manifests
+    };
+  });
+}
+
+function startAutoArchiveScheduler() {
+  if (!AUTO_ARCHIVE_ENABLED) {
+    console.log('Auto archive disabled');
+    return;
+  }
+
+  const runOnce = async () => {
+    try {
+      const result = await runAutomaticArchive('auto_scheduler');
+      console.log(
+        'Auto archive completed:',
+        JSON.stringify({
+          archiveWindow: result.archiveWindow,
+          manifests: result.manifests.map((m) => ({
+            table_name: m.table_name,
+            row_count: m.row_count,
+            file_name: m.file_name,
+            notes: m.notes
+          }))
+        })
+      );
+    } catch (err) {
+      console.error('Auto archive failed:', err.message);
+    }
+  };
+
+  setTimeout(runOnce, 10 * 1000);
+  setInterval(runOnce, AUTO_ARCHIVE_INTERVAL_MS);
+
+  console.log(
+    `Auto archive scheduler started. Interval: ${AUTO_ARCHIVE_INTERVAL_MS} ms`
+  );
 }
 
 function unauthorized(res) {
@@ -744,7 +1148,7 @@ app.post('/webhook/teams', requireWebhookSecret, async (req, res) => {
         };
       }
 
-      const explanation = await explainForReview(rawMessage, parseResult.reason, timestamp);
+      const explanation = await explainForReview(rawMessage, parseResult.reason);
 
 	const review = await client.query(
 	  `INSERT INTO review_queue (
@@ -1859,6 +2263,159 @@ app.post('/api/reviews/:id/reject', requireAdminApiKey, async (req, res) => {
   }
 });
 
+
+app.get('/api/archive/preview', requireAdminApiKey, async (req, res) => {
+  try {
+    const { tables, invalid } = normalizeArchiveTables(req.query.tables);
+
+    if (invalid.length) {
+      return res.status(400).json({
+        ok: false,
+        error: `invalid table(s): ${invalid.join(', ')}`
+      });
+    }
+
+    const { archiveStartIso, archiveEndIso, fileStartLabel, fileEndLabel } =
+      getExactArchiveWindow();
+
+    const payload = await withTransaction(async (client) => {
+      const previews = [];
+
+      for (const tableName of tables) {
+        const preview = await previewArchiveTable(client, tableName);
+        previews.push(preview);
+      }
+
+      return previews;
+    });
+
+    return res.json({
+      ok: true,
+      archiveWindow: {
+        archiveStartIso,
+        archiveEndIso,
+        fileStartLabel,
+        fileEndLabel
+      },
+      tables: payload
+    });
+  } catch (err) {
+    console.error('archive preview failed:', err.message);
+    return res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.post('/api/archive/export', requireAdminApiKey, async (req, res) => {
+  const performedBy = req.header('x-admin-user') || 'retool_admin';
+
+  try {
+    const { tables, invalid } = normalizeArchiveTables(req.body.tables);
+    if (invalid.length) {
+      return res.status(400).json({
+        ok: false,
+        error: `invalid table(s): ${invalid.join(', ')}`
+      });
+    }
+
+    const manifests = await withTransaction(async (client) => {
+      const results = [];
+
+      for (const tableName of tables) {
+        const manifest = await exportArchiveTable(client, tableName, performedBy);
+        results.push(manifest);
+      }
+
+      return results;
+    });
+
+    return res.json({
+      ok: true,
+      archiveWindow: getExactArchiveWindow(),
+      manifests
+    });
+  } catch (err) {
+    console.error('archive export failed:', err.message);
+    return res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.post('/api/archive/run-now', requireAdminApiKey, async (req, res) => {
+  const performedBy = req.header('x-admin-user') || 'retool_admin';
+
+  try {
+    const result = await runAutomaticArchive(performedBy || 'manual_run_now');
+    return res.json({ ok: true, ...result });
+  } catch (err) {
+    console.error('archive run-now failed:', err.message);
+    return res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.get('/api/archive/manifests', requireAdminApiKey, async (req, res) => {
+  try {
+    const result = await query(
+      `
+      SELECT
+        id,
+        table_name,
+        file_name,
+        file_path,
+        cutoff_time,
+        row_count,
+        checksum_sha256,
+        status,
+        performed_by,
+        created_at,
+        notes
+      FROM archive_manifest
+      ORDER BY created_at DESC, id DESC
+      LIMIT 200
+      `
+    );
+
+    return res.json({ ok: true, rows: result.rows });
+  } catch (err) {
+    console.error('get archive manifests failed:', err.message);
+    return res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.get('/api/archive/download/:id', requireAdminApiKey, async (req, res) => {
+  try {
+    const manifestId = Number(req.params.id);
+
+    if (!Number.isInteger(manifestId) || manifestId <= 0) {
+      return res.status(400).json({ ok: false, error: 'invalid manifest id' });
+    }
+
+    const result = await query(
+      `
+      SELECT id, file_name, file_path, status
+      FROM archive_manifest
+      WHERE id = $1
+      LIMIT 1
+      `,
+      [manifestId]
+    );
+
+    if (!result.rowCount) {
+      return res.status(404).json({ ok: false, error: 'archive file not found' });
+    }
+
+    const row = result.rows[0];
+
+    if (!fs.existsSync(row.file_path)) {
+      return res.status(404).json({ ok: false, error: 'archive file missing on disk' });
+    }
+
+    return res.download(row.file_path, row.file_name);
+  } catch (err) {
+    console.error('download archive file failed:', err.message);
+    return res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
 app.listen(port, () => {
   console.log(`ASTRO attendance backend listening on port ${port}`);
+  startAutoArchiveScheduler();
 });
