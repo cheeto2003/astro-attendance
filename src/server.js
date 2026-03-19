@@ -1491,7 +1491,6 @@ app.get('/api/attendance', requireAdminApiKey, async (req, res) => {
         ON rm.id = ae.raw_message_id
       WHERE e.active = true
       ORDER BY ae.event_time DESC
-      LIMIT 1000
       `
     );
 
