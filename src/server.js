@@ -1214,6 +1214,8 @@ app.get('/api/employees', requireAdminApiKey, async (req, res) => {
         e.active,
         e.created_at,
         e.updated_at,
+		e.position,
+		e.hourly_pay,
         ae_latest.event_type AS latest_event_type,
         ae_latest.event_time AS latest_event_time,
         CASE
@@ -1254,6 +1256,12 @@ app.post('/api/employees', requireAdminApiKey, async (req, res) => {
   try {
     const employeeName = String(req.body.employeeName || '').trim();
     const employeeEmail = String(req.body.employeeEmail || '').trim().toLowerCase();
+	const position = String(req.body.position || '').trim() || null;
+	const hourlyPay =
+  		req.body.hourlyPay !== undefined && req.body.hourlyPay !== ''
+    		? Number(req.body.hourlyPay)
+    		: null;
+	  
     const active =
       typeof req.body.active === 'boolean' ? req.body.active : true;
 
@@ -1270,12 +1278,14 @@ app.post('/api/employees', requireAdminApiKey, async (req, res) => {
         INSERT INTO employees (
           employee_name,
           employee_email,
+		  position,
+		  hourly_pay,
           active
         )
-        VALUES ($1, $2, $3)
+        VALUES ($1, $2, $3, $4, $5)
         RETURNING *
         `,
-        [employeeName, employeeEmail, active]
+        [employeeName, employeeEmail, position, hourlyPay, active]
       );
 
       const row = result.rows[0];
@@ -1334,6 +1344,11 @@ app.put('/api/employees/:id', requireAdminApiKey, async (req, res) => {
     const employeeEmail = String(req.body.employeeEmail || '').trim().toLowerCase();
     const active =
       typeof req.body.active === 'boolean' ? req.body.active : true;
+	const position = String(req.body.position || '').trim() || null;
+	const hourlyPay =
+  		req.body.hourlyPay !== undefined && req.body.hourlyPay !== ''
+    	? Number(req.body.hourlyPay)
+    	: null;
 
     if (!employeeId) {
       return res.status(400).json({
@@ -1368,16 +1383,17 @@ app.put('/api/employees/:id', requireAdminApiKey, async (req, res) => {
 
       const result = await client.query(
         `
-        UPDATE employees
-        SET
-          employee_name = $1,
-          employee_email = $2,
-          active = $3,
-          updated_at = NOW()
-        WHERE id = $4
+		UPDATE employees
+		SET
+		  employee_name = $1,
+		  employee_email = $2,
+		  position = $3,
+		  hourly_pay = $4,
+		  active = $5
+		WHERE id = $6
         RETURNING *
         `,
-        [employeeName, employeeEmail, active, employeeId]
+        [employeeName, employeeEmail, position, hourlyPay, active, employeeId]
       );
 
       const newRow = result.rows[0];
