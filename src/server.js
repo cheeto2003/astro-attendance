@@ -1905,7 +1905,7 @@ app.get('/api/payroll-summary', requireAdminApiKey, async (req, res) => {
       );
 
       current_rows.push({
-        employee_id: employee.id,
+        id: employee.id,
         employee_name: employee.employee_name,
         employee_email: employee.employee_email,
         hourly_pay: hourlyPay,
@@ -1915,7 +1915,7 @@ app.get('/api/payroll-summary', requireAdminApiKey, async (req, res) => {
       });
 
       previous_rows.push({
-        employee_id: employee.id,
+        id: employee.id,
         employee_name: employee.employee_name,
         employee_email: employee.employee_email,
         hourly_pay: hourlyPay,
