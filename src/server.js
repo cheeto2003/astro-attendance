@@ -1471,6 +1471,160 @@ app.put('/api/employees/:id', requireAdminApiKey, async (req, res) => {
   }
 });
 
+app.patch('/api/employees/:id/payroll', requireAdminApiKey, async (req, res) => {
+  const employeeId = String(req.params.id || '').trim();
+  const performedBy = req.header('x-admin-user') || 'retool_admin';
+
+  try {
+    if (!employeeId) {
+      return res.status(400).json({
+        ok: false,
+        error: 'employee id is required'
+      });
+    }
+
+    const hasHourlyPay = req.body.hourlyPay !== undefined;
+    const hasBonusCurrent = req.body.bonusCurrent !== undefined;
+    const hasBonusPrevious = req.body.bonusPrevious !== undefined;
+
+    if (!hasHourlyPay && !hasBonusCurrent && !hasBonusPrevious) {
+      return res.status(400).json({
+        ok: false,
+        error: 'at least one payroll field is required'
+      });
+    }
+
+    const hourlyPay =
+      hasHourlyPay && req.body.hourlyPay !== ''
+        ? Number(req.body.hourlyPay)
+        : null;
+
+    const bonusCurrent =
+      hasBonusCurrent && req.body.bonusCurrent !== ''
+        ? Number(req.body.bonusCurrent)
+        : null;
+
+    const bonusPrevious =
+      hasBonusPrevious && req.body.bonusPrevious !== ''
+        ? Number(req.body.bonusPrevious)
+        : null;
+
+    if (hasHourlyPay && req.body.hourlyPay !== '' && Number.isNaN(hourlyPay)) {
+      return res.status(400).json({
+        ok: false,
+        error: 'hourlyPay must be a valid number'
+      });
+    }
+
+    if (hasBonusCurrent && req.body.bonusCurrent !== '' && Number.isNaN(bonusCurrent)) {
+      return res.status(400).json({
+        ok: false,
+        error: 'bonusCurrent must be a valid number'
+      });
+    }
+
+    if (hasBonusPrevious && req.body.bonusPrevious !== '' && Number.isNaN(bonusPrevious)) {
+      return res.status(400).json({
+        ok: false,
+        error: 'bonusPrevious must be a valid number'
+      });
+    }
+
+    const updated = await withTransaction(async (client) => {
+      const existing = await client.query(
+        `
+        SELECT *
+        FROM employees
+        WHERE id = $1
+        LIMIT 1
+        `,
+        [employeeId]
+      );
+
+      if (!existing.rowCount) {
+        throw new Error('employee not found');
+      }
+
+      const oldRow = existing.rows[0];
+
+      const result = await client.query(
+        `
+        UPDATE employees
+        SET
+          hourly_pay = CASE
+            WHEN $1::boolean THEN $2
+            ELSE hourly_pay
+          END,
+          bonus_current = CASE
+            WHEN $3::boolean THEN $4
+            ELSE bonus_current
+          END,
+          bonus_previous = CASE
+            WHEN $5::boolean THEN $6
+            ELSE bonus_previous
+          END,
+          updated_at = NOW()
+        WHERE id = $7
+        RETURNING *
+        `,
+        [
+          hasHourlyPay,
+          hourlyPay,
+          hasBonusCurrent,
+          bonusCurrent,
+          hasBonusPrevious,
+          bonusPrevious,
+          employeeId
+        ]
+      );
+
+      const newRow = result.rows[0];
+
+      await client.query(
+        `
+        INSERT INTO audit_log (
+          entity_type,
+          entity_id,
+          action,
+          old_value,
+          new_value,
+          performed_by,
+          notes
+        )
+        VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, $6, $7)
+        `,
+        [
+          'employee',
+          String(employeeId),
+          'update_payroll',
+          JSON.stringify(oldRow),
+          JSON.stringify(newRow),
+          performedBy,
+          'Payroll Master updated hourly pay / bonuses'
+        ]
+      );
+
+      return newRow;
+    });
+
+    return res.json({ ok: true, row: updated });
+  } catch (err) {
+    console.error('update employee payroll failed:', err.message);
+
+    if (err.message === 'employee not found') {
+      return res.status(404).json({
+        ok: false,
+        error: 'employee not found'
+      });
+    }
+
+    return res.status(500).json({
+      ok: false,
+      error: 'update employee payroll failed'
+    });
+  }
+});
+
 app.get('/api/reviews', requireAdminApiKey, async (req, res) => {
   try {
     const status = String(req.query.status || 'pending');
