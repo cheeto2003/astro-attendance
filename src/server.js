@@ -1216,6 +1216,8 @@ app.get('/api/employees', requireAdminApiKey, async (req, res) => {
         e.updated_at,
 		e.position,
 		e.hourly_pay,
+		e.bonus_current,
+		e.bonus_previous,
         ae_latest.event_type AS latest_event_type,
         ae_latest.event_time AS latest_event_time,
         CASE
@@ -1261,7 +1263,14 @@ app.post('/api/employees', requireAdminApiKey, async (req, res) => {
   		req.body.hourlyPay !== undefined && req.body.hourlyPay !== ''
     		? Number(req.body.hourlyPay)
     		: null;
-	  
+	const bonusCurrent =
+	  req.body.bonusCurrent !== undefined && req.body.bonusCurrent !== ''
+	    ? Number(req.body.bonusCurrent)
+	    : null;
+	const bonusPrevious =
+	  req.body.bonusPrevious !== undefined && req.body.bonusPrevious !== ''
+	    ? Number(req.body.bonusPrevious)
+	    : null;
     const active =
       typeof req.body.active === 'boolean' ? req.body.active : true;
 
@@ -1275,17 +1284,19 @@ app.post('/api/employees', requireAdminApiKey, async (req, res) => {
     const created = await withTransaction(async (client) => {
       const result = await client.query(
         `
-        INSERT INTO employees (
-          employee_name,
-          employee_email,
+		INSERT INTO employees (
+		  employee_name,
+		  employee_email,
 		  position,
 		  hourly_pay,
-          active
-        )
-        VALUES ($1, $2, $3, $4, $5)
+		  bonus_current,
+		  bonus_previous,
+		  active
+		)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)
         RETURNING *
         `,
-        [employeeName, employeeEmail, position, hourlyPay, active]
+        [employeeName, employeeEmail, position, hourlyPay, bonusCurrent, bonusPrevious, active]
       );
 
       const row = result.rows[0];
@@ -1349,6 +1360,14 @@ app.put('/api/employees/:id', requireAdminApiKey, async (req, res) => {
   		req.body.hourlyPay !== undefined && req.body.hourlyPay !== ''
     	? Number(req.body.hourlyPay)
     	: null;
+	const bonusCurrent =
+	  req.body.bonusCurrent !== undefined && req.body.bonusCurrent !== ''
+	    ? Number(req.body.bonusCurrent)
+	    : null;
+	const bonusPrevious =
+	  req.body.bonusPrevious !== undefined && req.body.bonusPrevious !== ''
+	    ? Number(req.body.bonusPrevious)
+	    : null;
 
     if (!employeeId) {
       return res.status(400).json({
@@ -1389,11 +1408,13 @@ app.put('/api/employees/:id', requireAdminApiKey, async (req, res) => {
 		  employee_email = $2,
 		  position = $3,
 		  hourly_pay = $4,
-		  active = $5
-		WHERE id = $6
+		  bonus_current = $5,
+		  bonus_previous = $6,
+		  active = $7
+		WHERE id = $8
         RETURNING *
         `,
-        [employeeName, employeeEmail, position, hourlyPay, active, employeeId]
+        [employeeName, employeeEmail, position, hourlyPay, bonusCurrent, bonusPrevious, active, employeeId]
       );
 
       const newRow = result.rows[0];
@@ -1806,6 +1827,121 @@ app.post('/api/attendance/manual', requireAdminApiKey, async (req, res) => {
   } catch (err) {
     console.error('manual attendance create failed:', err.message);
     return res.status(400).json({ ok: false, error: err.message });
+  }
+});
+
+app.get('/api/payroll-summary', requireAdminApiKey, async (req, res) => {
+  try {
+    const bounds = getBiweeklyBounds();
+
+    const employeesResult = await query(
+      `
+      SELECT
+        id,
+        employee_name,
+        employee_email,
+        hourly_pay,
+        bonus_current,
+        bonus_previous
+      FROM employees
+      WHERE active = true
+      ORDER BY employee_name
+      `
+    );
+
+    const eventsResult = await query(
+      `
+      SELECT
+        id,
+        employee_id,
+        employee_email,
+        event_type,
+        event_time
+      FROM attendance_events
+      ORDER BY employee_id, event_time ASC, id ASC
+      `
+    );
+
+    const eventsByEmployee = new Map();
+
+    for (const event of eventsResult.rows) {
+      const key = String(event.employee_id);
+      if (!eventsByEmployee.has(key)) {
+        eventsByEmployee.set(key, []);
+      }
+      eventsByEmployee.get(key).push(event);
+    }
+
+    const currentStart = bounds.currentStart.toUTC();
+    const currentEnd = bounds.currentEnd.toUTC();
+    const previousStart = bounds.previousStart.toUTC();
+    const previousEnd = bounds.previousEnd.toUTC();
+
+    const current_rows = [];
+    const previous_rows = [];
+
+    for (const employee of employeesResult.rows) {
+      const employeeEvents = eventsByEmployee.get(String(employee.id)) || [];
+
+      const hourlyPay =
+        employee.hourly_pay !== null ? Number(employee.hourly_pay) : 0;
+
+      const bonusCurrent =
+        employee.bonus_current !== null ? Number(employee.bonus_current) : 0;
+
+      const bonusPrevious =
+        employee.bonus_previous !== null ? Number(employee.bonus_previous) : 0;
+
+      const currentHours = computeWorkedHoursForRange(
+        employeeEvents,
+        currentStart,
+        currentEnd
+      );
+
+      const previousHours = computeWorkedHoursForRange(
+        employeeEvents,
+        previousStart,
+        previousEnd
+      );
+
+      current_rows.push({
+        employee_id: employee.id,
+        employee_name: employee.employee_name,
+        employee_email: employee.employee_email,
+        hourly_pay: hourlyPay,
+        biweekly_current: currentHours,
+        bonus_current: bonusCurrent,
+        total: Number(((currentHours * hourlyPay) + bonusCurrent).toFixed(2))
+      });
+
+      previous_rows.push({
+        employee_id: employee.id,
+        employee_name: employee.employee_name,
+        employee_email: employee.employee_email,
+        hourly_pay: hourlyPay,
+        biweekly_previous: previousHours,
+        bonus_previous: bonusPrevious,
+        total: Number(((previousHours * hourlyPay) + bonusPrevious).toFixed(2))
+      });
+    }
+
+    return res.json({
+      ok: true,
+      pay_periods: {
+        current_start: bounds.currentStart.toISO(),
+        current_end: bounds.currentEnd.toISO(),
+        previous_start: bounds.previousStart.toISO(),
+        previous_end: bounds.previousEnd.toISO()
+      },
+      current_rows,
+      previous_rows
+    });
+  } catch (err) {
+    console.error('payroll summary failed:', err);
+    return res.status(500).json({
+      ok: false,
+      error: 'payroll summary failed'
+    });
   }
 });
 
